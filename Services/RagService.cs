@@ -13,6 +13,12 @@ namespace GenerativeAssistantApi.Services
         private readonly KnowledgeStore _store;
         public RagService(KnowledgeStore store) => _store = store;
 
+        /// <summary>
+        /// Recupera bloques relevantes de los documentos en Knowledge/ basados en la consulta.
+        /// - Usa front-matter (title, category, tags) para boosting.
+        /// - Trabaja por bloques de sección (##/###), no por líneas sueltas.
+        /// - Aplica normalización, intención y ranking simple.
+        /// </summary>
         public string Retrieve(string query, int maxBlocks = 3)
         {
             var raw = _store.ReadAll() ?? string.Empty;
@@ -68,17 +74,16 @@ namespace GenerativeAssistantApi.Services
 
                     // Bonus por intención de "procedimiento" en títulos con "crear"
                     if (intentProcedimiento && (normBlockTitle.Contains("crear") || normDocTitle.Contains("crear")))
-                        score += 2.5;
+                        score += 4.0; // más fuerte
 
                     // Demote FAQ si intención es procedimiento
                     if (intentProcedimiento && normBlockTitle.Contains("preguntas frecuentes"))
-                        score -= 2.0;  // más fuerte para evitar que gane
+                        score -= 3.0;  // evitar que gane
 
                     // Boost por categoría
                     if (intentSeguridad && category == "seguridad") score *= 1.6;
                     if (intentVentas && category == "ventas") score *= 1.6;
 
-                    // Si quedó en <= 0, no lo consideres
                     if (score <= 0) continue;
 
                     scoredBlocks.Add((score, docTitle, category, blockTitle, blockContent));
@@ -104,8 +109,7 @@ namespace GenerativeAssistantApi.Services
                 return sb.ToString().Trim();
             }
 
-
-            // Fallback inteligente
+            // 5) Fallback inteligente
             var fallbackDoc = PickFallbackDocument(docs, intentSeguridad ? "seguridad" : (intentVentas ? "ventas" : null));
             var metaFb = ParseFrontMatter(fallbackDoc);
             var fbTitle = metaFb.TryGetValue("title", out var ft) ? ft : (ExtractH1(fallbackDoc) ?? "(sin título)");
@@ -113,23 +117,20 @@ namespace GenerativeAssistantApi.Services
             var fbBody = RemoveFrontMatter(fallbackDoc);
             var fbBlocksAll = SplitBlocks(fbBody);
 
-            // Orden preferente de bloques si la intención es procedimiento (evitar FAQ)
             var prefer = intentVentas
                 ? new[] { "Acceso", "Ir al módulo", "Datos del cliente", "Agregar", "Impuestos", "Confirmar y guardar" }
                 : intentSeguridad
-                    ? new[] { "Acceder", "Crear nuevo rol", "Asignar permisos", "Asociar usuarios" }
+                    ? new[] { "Acceder", "Crear nuevo rol", "Asignar permisos", "Asociar usuarios", "Crear nuevo usuario" }
                     : Array.Empty<string>();
 
-            // ✅ Unificar tipo (soluciona el error del condicional)
-            var fbBlocksOrdered =
-                (prefer.Length == 0)
+            // Unificar tipo y materializar para evitar error de condicional (List vs IOrderedEnumerable)
+            var fbBlocksOrdered = (prefer.Length == 0)
                 ? fbBlocksAll
                 : fbBlocksAll
                     .OrderByDescending(b => prefer.Any(p => b.title.IndexOf(p, StringComparison.OrdinalIgnoreCase) >= 0))
                     .ThenBy(b => b.title)
-                    .ToList(); // <- opcional, útil si quieres List
+                    .ToList();
 
-            // Filtrar FAQ si la intención es procedimiento
             var fbTop2 = fbBlocksOrdered
                 .Where(b => intentProcedimiento ? !Normalize(b.title).Contains("preguntas frecuentes") : true)
                 .Take(2)
@@ -137,14 +138,12 @@ namespace GenerativeAssistantApi.Services
 
             return $"(Fallback) Basado en la documentación:\n\n# {fbTitle}  ({fbCategory})\n\n" +
                    string.Join("\n\n", fbTop2);
-
         }
 
         // ===== Helpers =====
 
         private static string StripBom(string s)
         {
-            // Quita BOM (UTF-8) si existe
             if (string.IsNullOrEmpty(s)) return s;
             var bom = "\uFEFF";
             return s.StartsWith(bom) ? s.Substring(bom.Length) : s;
@@ -162,7 +161,7 @@ namespace GenerativeAssistantApi.Services
                     sb.Append(ch);
             }
             var res = sb.ToString().Normalize(NormalizationForm.FormC);
-            res = Regex.Replace(res, @"\s+", " ").Trim();
+            res = Regex.Replace(res, "\\s+", " ").Trim();
             return res;
         }
 
@@ -173,41 +172,36 @@ namespace GenerativeAssistantApi.Services
 
         private static IEnumerable<string> SplitDocumentsRobust(string content)
         {
-            // Soporta:
-            // - Front-matter: "---\r?\n ... \r?\n---"
-            // - O, si no hay front-matter, H1: "^# "
-            var parts = new List<string>();
-
             // Primero intenta por front-matter
-            var fmSplits = Regex.Split(content, @"(?m)(?=^---\r?\n)")
+            var fmSplits = Regex.Split(content, "(?m)(?=^---\\r?\\n)")
                                 .Where(p => !string.IsNullOrWhiteSpace(p))
                                 .ToList();
-
             if (fmSplits.Count > 0)
                 return fmSplits;
 
             // Si no hay front-matter, dividir por H1
-            var h1Splits = Regex.Split(content, @"(?m)(?=^\s*#\s+)")
+            var h1Splits = Regex.Split(content, "(?m)(?=^\\s*#\\s+)")
                                 .Where(p => !string.IsNullOrWhiteSpace(p))
                                 .ToList();
-
             return h1Splits.Count > 0 ? h1Splits : new[] { content };
         }
 
         private static Dictionary<string, string> ParseFrontMatter(string doc)
         {
             var dict = new Dictionary<string, string>();
-
-            // Permitir CRLF y línea vacía después
-            var m = Regex.Match(doc, @"(?m)^---\r?\n(?<yaml>[\s\S]*?)\r?\n---\r?\n?");
+            var m = Regex.Match(doc, "(?m)^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?");
             if (m.Success)
             {
-                var yaml = m.Groups["yaml"].Value;
-                foreach (var line in yaml.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+                var yaml = m.Groups[1].Value;
+                foreach (var line in Regex.Split(yaml, "\\r?\\n"))
                 {
-                    var kv = Regex.Match(line, @"^\s*(?<k>[A-Za-z_]+)\s*:\s*(?<v>.+)\s*$");
+                    var kv = Regex.Match(line, "^\\s*([A-Za-z_]+)\\s*:\\s*(.+)\\s*$");
                     if (kv.Success)
-                        dict[kv.Groups["k"].Value] = kv.Groups["v"].Value.Trim().Trim('"');
+                    {
+                        var k = kv.Groups[1].Value;
+                        var v = kv.Groups[2].Value.Trim().Trim('"');
+                        dict[k] = v;
+                    }
                 }
             }
 
@@ -228,13 +222,13 @@ namespace GenerativeAssistantApi.Services
 
         private static string RemoveFrontMatter(string doc)
         {
-            return Regex.Replace(doc, @"(?m)^---\r?\n[\s\S]*?\r?\n---\r?\n?", "", RegexOptions.Multiline);
+            return Regex.Replace(doc, "(?m)^---\\r?\\n[\\s\\S]*?\\r?\\n---\\r?\\n?", "", RegexOptions.Multiline);
         }
 
         private static string? ExtractH1(string doc)
         {
-            var h1 = Regex.Match(doc, @"(?m)^\s*#\s+(?<t>.+)$");
-            return h1.Success ? h1.Groups["t"].Value.Trim() : null;
+            var h1 = Regex.Match(doc, "(?m)^\\s*#\\s+(.+)$");
+            return h1.Success ? h1.Groups[1].Value.Trim() : null;
         }
 
         private static string InferCategory(string doc)
@@ -255,8 +249,8 @@ namespace GenerativeAssistantApi.Services
 
             foreach (var line in lines)
             {
-                var h2 = Regex.Match(line, @"^\s*##\s+(.*)$");
-                var h3 = Regex.Match(line, @"^\s*###\s+(.*)$");
+                var h2 = Regex.Match(line, "^\\s*##\\s+(.*)$");
+                var h3 = Regex.Match(line, "^\\s*###\\s+(.*)$");
 
                 if (h2.Success || h3.Success)
                 {
@@ -291,7 +285,7 @@ namespace GenerativeAssistantApi.Services
 
         private static IEnumerable<string> Tokenize(string text)
         {
-            return Regex.Matches(text, @"[a-zA-Záéíóúñü]+")
+            return Regex.Matches(text, "[a-zA-Záéíóúñü]+")
                         .Select(m => Normalize(m.Value))
                         .Where(t => t.Length > 1)
                         .Distinct();
