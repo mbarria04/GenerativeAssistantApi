@@ -1,5 +1,10 @@
 
+using System;
+using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Globalization;
+using System.Collections.Generic;
 
 namespace GenerativeAssistantApi.Services
 {
@@ -8,42 +13,308 @@ namespace GenerativeAssistantApi.Services
         private readonly KnowledgeStore _store;
         public RagService(KnowledgeStore store) => _store = store;
 
-        public string Retrieve(string query, int maxLines = 40)
+        public string Retrieve(string query, int maxBlocks = 3)
         {
-            // 1) Leer todo el contenido (Markdowns)
-            var content = _store.ReadAll() ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(content))
+            var raw = _store.ReadAll() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(raw))
                 return "(No hay documentos en Knowledge/)";
 
-            // 2) Tokenizar la consulta con Regex para obtener palabras significativas
-            var keywords = Regex.Matches(query ?? string.Empty, @"\w+")
-                                .Select(m => m.Value.ToLowerInvariant())
-                                .Distinct()
-                                .ToArray();
+            // 0) Normalización básica: quitar BOM y decodificar HTML
+            raw = StripBom(raw);
+            raw = DecodeHtmlEntities(raw);
 
-            // 3) Dividir el contenido en líneas (soporta \r\n y \n)
-            var lines = content.Replace("\r\n", "\n").Split('\n');
+            // 1) Normalizar consulta (minúsculas, sin tildes)
+            string q = Normalize(query ?? "");
 
-            // 4) Buscar líneas que contengan cualquiera de las keywords (case-insensitive)
-            var matched = lines
-                .Where(l => keywords.Length == 0
-                            ? false
-                            : keywords.Any(k => l.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0))
-                .Take(maxLines)
-                .ToArray();
+            // 2) Intención (simple y efectiva)
+            bool intentSeguridad = ContainsAny(q, new[] { "rol", "roles", "permiso", "permisos", "seguridad", "usuario", "usuarios", "perfil" });
+            bool intentVentas = ContainsAny(q, new[] { "factura", "ventas", "cliente", "cobro", "emitir", "facturacion", "facturación" });
+            bool intentProcedimiento = ContainsAny(q, new[] { "crear", "generar", "como", "cómo", "pasos", "hacer" });
 
-            // 5) Si no hay coincidencias, devolver las primeras líneas como contexto básico
-            if (matched.Length == 0)
-                matched = lines.Take(Math.Min(maxLines, lines.Length)).ToArray();
+            // 3) Separar documentos: por front-matter o por H1
+            var docs = SplitDocumentsRobust(raw).ToList();
+            if (docs.Count == 0) docs.Add(raw);
 
-            // 6) Unir líneas con salto de línea (no string.Empty)
-            var ctx = string.Join("\n", matched);
+            var scoredBlocks = new List<(double score, string docTitle, string category, string blockTitle, string blockContent)>();
 
-            // 7) Garantizar que el resultado no sea vacío
-            if (string.IsNullOrWhiteSpace(ctx))
-                ctx = "(No se encontraron fragmentos relevantes)";
+            foreach (var doc in docs)
+            {
+                var meta = ParseFrontMatter(doc);
+                var docTitle = meta.TryGetValue("title", out var t) ? t : (ExtractH1(doc) ?? "(sin título)");
+                var category = meta.TryGetValue("category", out var c) ? c.ToLowerInvariant() : InferCategory(doc);
+                var tagsStr = meta.TryGetValue("tags", out var tg) ? tg : "";
+                var tagsNorm = Normalize(tagsStr);
 
-            return ctx;
+                var body = RemoveFrontMatter(doc);
+                var blocks = SplitBlocks(body); // (title, content)
+
+                foreach (var (blockTitle, blockContent) in blocks)
+                {
+                    var normBlockTitle = Normalize(blockTitle);
+                    var normDocTitle = Normalize(docTitle);
+                    var normContent = Normalize(blockContent);
+
+                    double score = 0;
+                    var qTokens = Tokenize(q);
+
+                    foreach (var tok in qTokens)
+                    {
+                        // Pesar título del bloque, título del doc, tags y contenido
+                        if (normBlockTitle.Contains(tok)) score += 3;
+                        if (normDocTitle.Contains(tok)) score += 2;
+                        if (tagsNorm.Contains(tok)) score += 2;
+                        score += CountOccurrences(normContent, tok) * 1;
+                    }
+
+                    // Bonus por intención de "procedimiento" en títulos con "crear"
+                    if (intentProcedimiento && (normBlockTitle.Contains("crear") || normDocTitle.Contains("crear")))
+                        score += 2.5;
+
+                    // Demote FAQ si intención es procedimiento
+                    if (intentProcedimiento && normBlockTitle.Contains("preguntas frecuentes"))
+                        score -= 2.0;  // más fuerte para evitar que gane
+
+                    // Boost por categoría
+                    if (intentSeguridad && category == "seguridad") score *= 1.6;
+                    if (intentVentas && category == "ventas") score *= 1.6;
+
+                    // Si quedó en <= 0, no lo consideres
+                    if (score <= 0) continue;
+
+                    scoredBlocks.Add((score, docTitle, category, blockTitle, blockContent));
+                }
+            }
+
+            // 4) Responder con los mejores bloques
+            if (scoredBlocks.Count > 0)
+            {
+                var top = scoredBlocks
+                    .OrderByDescending(x => x.score)
+                    .Take(Math.Max(1, maxBlocks))
+                    .ToList();
+
+                var sb = new StringBuilder();
+                foreach (var b in top)
+                {
+                    sb.AppendLine($"# {b.docTitle}  ({b.category})");
+                    sb.AppendLine($"## {b.blockTitle}");
+                    sb.AppendLine(b.blockContent.Trim());
+                    sb.AppendLine();
+                }
+                return sb.ToString().Trim();
+            }
+
+
+            // Fallback inteligente
+            var fallbackDoc = PickFallbackDocument(docs, intentSeguridad ? "seguridad" : (intentVentas ? "ventas" : null));
+            var metaFb = ParseFrontMatter(fallbackDoc);
+            var fbTitle = metaFb.TryGetValue("title", out var ft) ? ft : (ExtractH1(fallbackDoc) ?? "(sin título)");
+            var fbCategory = metaFb.TryGetValue("category", out var fc) ? fc : InferCategory(fallbackDoc);
+            var fbBody = RemoveFrontMatter(fallbackDoc);
+            var fbBlocksAll = SplitBlocks(fbBody);
+
+            // Orden preferente de bloques si la intención es procedimiento (evitar FAQ)
+            var prefer = intentVentas
+                ? new[] { "Acceso", "Ir al módulo", "Datos del cliente", "Agregar", "Impuestos", "Confirmar y guardar" }
+                : intentSeguridad
+                    ? new[] { "Acceder", "Crear nuevo rol", "Asignar permisos", "Asociar usuarios" }
+                    : Array.Empty<string>();
+
+            // ✅ Unificar tipo (soluciona el error del condicional)
+            var fbBlocksOrdered =
+                (prefer.Length == 0)
+                ? fbBlocksAll
+                : fbBlocksAll
+                    .OrderByDescending(b => prefer.Any(p => b.title.IndexOf(p, StringComparison.OrdinalIgnoreCase) >= 0))
+                    .ThenBy(b => b.title)
+                    .ToList(); // <- opcional, útil si quieres List
+
+            // Filtrar FAQ si la intención es procedimiento
+            var fbTop2 = fbBlocksOrdered
+                .Where(b => intentProcedimiento ? !Normalize(b.title).Contains("preguntas frecuentes") : true)
+                .Take(2)
+                .Select(b => $"## {b.title}\n{b.content.Trim()}");
+
+            return $"(Fallback) Basado en la documentación:\n\n# {fbTitle}  ({fbCategory})\n\n" +
+                   string.Join("\n\n", fbTop2);
+
+        }
+
+        // ===== Helpers =====
+
+        private static string StripBom(string s)
+        {
+            // Quita BOM (UTF-8) si existe
+            if (string.IsNullOrEmpty(s)) return s;
+            var bom = "\uFEFF";
+            return s.StartsWith(bom) ? s.Substring(bom.Length) : s;
+        }
+
+        private static string Normalize(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var lower = s.ToLowerInvariant().Normalize(NormalizationForm.FormD);
+            var sb = new StringBuilder();
+            foreach (var ch in lower)
+            {
+                var uc = CharUnicodeInfo.GetUnicodeCategory(ch);
+                if (uc != UnicodeCategory.NonSpacingMark)
+                    sb.Append(ch);
+            }
+            var res = sb.ToString().Normalize(NormalizationForm.FormC);
+            res = Regex.Replace(res, @"\s+", " ").Trim();
+            return res;
+        }
+
+        private static string DecodeHtmlEntities(string s)
+        {
+            return s.Replace("&gt;", ">").Replace("&lt;", "<").Replace("&amp;", "&");
+        }
+
+        private static IEnumerable<string> SplitDocumentsRobust(string content)
+        {
+            // Soporta:
+            // - Front-matter: "---\r?\n ... \r?\n---"
+            // - O, si no hay front-matter, H1: "^# "
+            var parts = new List<string>();
+
+            // Primero intenta por front-matter
+            var fmSplits = Regex.Split(content, @"(?m)(?=^---\r?\n)")
+                                .Where(p => !string.IsNullOrWhiteSpace(p))
+                                .ToList();
+
+            if (fmSplits.Count > 0)
+                return fmSplits;
+
+            // Si no hay front-matter, dividir por H1
+            var h1Splits = Regex.Split(content, @"(?m)(?=^\s*#\s+)")
+                                .Where(p => !string.IsNullOrWhiteSpace(p))
+                                .ToList();
+
+            return h1Splits.Count > 0 ? h1Splits : new[] { content };
+        }
+
+        private static Dictionary<string, string> ParseFrontMatter(string doc)
+        {
+            var dict = new Dictionary<string, string>();
+
+            // Permitir CRLF y línea vacía después
+            var m = Regex.Match(doc, @"(?m)^---\r?\n(?<yaml>[\s\S]*?)\r?\n---\r?\n?");
+            if (m.Success)
+            {
+                var yaml = m.Groups["yaml"].Value;
+                foreach (var line in yaml.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+                {
+                    var kv = Regex.Match(line, @"^\s*(?<k>[A-Za-z_]+)\s*:\s*(?<v>.+)\s*$");
+                    if (kv.Success)
+                        dict[kv.Groups["k"].Value] = kv.Groups["v"].Value.Trim().Trim('"');
+                }
+            }
+
+            // Respaldo: H1 como title si falta
+            if (!dict.ContainsKey("title"))
+            {
+                var h1 = ExtractH1(doc);
+                if (!string.IsNullOrWhiteSpace(h1))
+                    dict["title"] = h1!;
+            }
+
+            // Inferir category si falta
+            if (!dict.ContainsKey("category"))
+                dict["category"] = InferCategory(doc);
+
+            return dict;
+        }
+
+        private static string RemoveFrontMatter(string doc)
+        {
+            return Regex.Replace(doc, @"(?m)^---\r?\n[\s\S]*?\r?\n---\r?\n?", "", RegexOptions.Multiline);
+        }
+
+        private static string? ExtractH1(string doc)
+        {
+            var h1 = Regex.Match(doc, @"(?m)^\s*#\s+(?<t>.+)$");
+            return h1.Success ? h1.Groups["t"].Value.Trim() : null;
+        }
+
+        private static string InferCategory(string doc)
+        {
+            var body = Normalize(RemoveFrontMatter(doc));
+            if (ContainsAny(body, new[] { "factura", "ventas", "cliente", "cobro" })) return "ventas";
+            if (ContainsAny(body, new[] { "rol", "roles", "permiso", "seguridad", "usuario" })) return "seguridad";
+            return "general";
+        }
+
+        private static List<(string title, string content)> SplitBlocks(string body)
+        {
+            var text = body.Replace("\r\n", "\n");
+            var lines = text.Split('\n');
+            var blocks = new List<(string title, StringBuilder content)>();
+            StringBuilder? current = null;
+            string currentTitle = "(sin título)";
+
+            foreach (var line in lines)
+            {
+                var h2 = Regex.Match(line, @"^\s*##\s+(.*)$");
+                var h3 = Regex.Match(line, @"^\s*###\s+(.*)$");
+
+                if (h2.Success || h3.Success)
+                {
+                    if (current != null)
+                        blocks.Add((currentTitle, current));
+
+                    currentTitle = (h2.Success ? h2.Groups[1].Value : h3.Groups[1].Value).Trim();
+                    current = new StringBuilder();
+                }
+                else
+                {
+                    current ??= new StringBuilder();
+                    current.AppendLine(line);
+                }
+            }
+            if (current != null)
+                blocks.Add((currentTitle, current));
+
+            return blocks.Select(b => (b.title, b.content.ToString())).ToList();
+        }
+
+        private static bool ContainsAny(string text, IEnumerable<string> terms)
+        {
+            var normText = Normalize(text);
+            foreach (var t in terms)
+            {
+                var tok = Normalize(t);
+                if (normText.Contains(tok)) return true;
+            }
+            return false;
+        }
+
+        private static IEnumerable<string> Tokenize(string text)
+        {
+            return Regex.Matches(text, @"[a-zA-Záéíóúñü]+")
+                        .Select(m => Normalize(m.Value))
+                        .Where(t => t.Length > 1)
+                        .Distinct();
+        }
+
+        private static int CountOccurrences(string text, string term)
+        {
+            if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(term)) return 0;
+            return Regex.Matches(text, Regex.Escape(term)).Count;
+        }
+
+        private static string PickFallbackDocument(IEnumerable<string> docs, string? preferredCategory)
+        {
+            if (preferredCategory != null)
+            {
+                foreach (var d in docs)
+                {
+                    var meta = ParseFrontMatter(d);
+                    var cat = meta.TryGetValue("category", out var c) ? c.ToLowerInvariant() : InferCategory(d);
+                    if (cat == preferredCategory) return d;
+                }
+            }
+            return docs.FirstOrDefault() ?? string.Empty;
         }
     }
 }
