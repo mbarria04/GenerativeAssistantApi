@@ -1,3 +1,10 @@
+---
+title: Crear Factura de Venta
+category: ventas
+tags: [factura, ventas, cliente]
+last_updated: 2025-12-11
+---
+
 # Guía: Crear una Factura de Venta
 
 ## 1. Acceso al sistema
@@ -59,21 +66,15 @@
 ---
 
 ### Preguntas frecuentes
-**¿Qué hago si no hay stock?**
-- Marca la factura **On Hold** o genera una **orden de compra** para reabastecer.
-
-**¿Cómo aplico un descuento?**
-- En el ítem, usa el campo **% descuento** o aplica un descuento general antes de guardar.
-
-**¿Puedo editar una factura emitida?**
-- Según políticas, crea una **nota de crédito** o **anula** y vuelve a emitir.
-
-**¿Cómo envío la factura por email?**
-- Usa el botón **Enviar** y confirma el correo del cliente.
+**¿Cómo crear una factura?** → Sigue los pasos desde la sección [Acceso al sistema](#1-acceso-al-sistema) hasta [Confirmar y guardar](#6-confirmar-y-guardar).
+**¿Qué hago si no hay stock?** → Marca la factura **On Hold** o genera una **orden de compra** para reabastecer.
+**¿Cómo aplico un descuento?** → En el ítem, usa el campo **% descuento** o aplica un descuento general antes de guardar.
+**¿Puedo editar una factura emitida?** → Según políticas, crea una **nota de crédito** o **anula** y vuelve a emitir.
+**¿Cómo envío la factura por email?** → Usa el botón **Enviar** y confirma el correo del cliente.
 
 ---
 
 ### Trazabilidad
 - Fuente: Manual interno de Ventas.
 - Responsable: Área Comercial.
-- Última actualización: 2025-12-10.
+- Última actualización: 2025-12-11.
