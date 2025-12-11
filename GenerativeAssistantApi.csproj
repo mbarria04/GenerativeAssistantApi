@@ -1,0 +1,21 @@
+
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>GenerativeAssistantApi</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Alineado para evitar NU1603 -->
+      <PackageReference Include="Azure.AI.OpenAI" Version="2.1.0" />
+      <PackageReference Include="Swashbuckle.AspNetCore" Version="10.0.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- No incluimos wwwroot para evitar duplicados de Content -->
+    <!-- Copia los documentos de Knowledge al output sin duplicar (Update, no Include) -->
+    <None Update="Knowledge\**\*">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>
